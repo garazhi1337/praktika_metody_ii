@@ -88,71 +88,78 @@ roc_auc = roc_auc_score(y_test, y_pred_proba)
 print(f"ROC-AUC логистической регрессии: {roc_auc:.4f}")
 
 import optuna
-from catboost import CatBoostClassifier
+from sklearn.base import clone
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
-import numpy as np
 
-cat_features = categorical_cols
 
-# 1. Определяем целевую функцию для Optuna
-def objective(trial, X_train, y_train, cat_features):
+def objective(trial, X_train, y_train):
     params = {
-        'iterations': trial.suggest_int('iterations', 200, 800, step=50),
-        'depth': trial.suggest_int('depth', 4, 8),
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-        'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1e-3, 10.0, log=True),
-        'border_count': trial.suggest_int('border_count', 32, 128),
-        'random_seed': 42,
-        'verbose': False,
-        'early_stopping_rounds': 50,
-        'auto_class_weights': 'Balanced'
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05, log=True),
+        'max_depth': trial.suggest_int('max_depth', 3, 10),
+        'max_iter': trial.suggest_int('max_iter', 200, 800, step=25),
+        'l2_regularization': trial.suggest_float('l2_regularization', 0.01, 0.5),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 20, 100),
+        'max_leaf_nodes': trial.suggest_int('max_leaf_nodes', 130, 500),
     }
+    clf = HistGradientBoostingClassifier(
+        random_state=42,
+        class_weight='balanced',
+        early_stopping=True,
+        validation_fraction=0.12,
+        n_iter_no_change=25,
+        **params,
+    )
+    pipeline = Pipeline(
+        steps=[('preprocessor', clone(preprocessor)), ('classifier', clf)]
+    )
 
-    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     cv_scores = []
 
     for train_idx, val_idx in cv.split(X_train, y_train):
         X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
         y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
 
-        model = CatBoostClassifier(**params)
-        model.fit(X_tr, y_tr,
-                  eval_set=(X_val, y_val),
-                  cat_features=cat_features,
-                  verbose=False)
+        pipeline.fit(X_tr, y_tr)
+        y_pred_proba = pipeline.predict_proba(X_val)[:, 1]
+        cv_scores.append(roc_auc_score(y_val, y_pred_proba))
 
-        y_pred_proba = model.predict_proba(X_val)[:, 1]
-        score = roc_auc_score(y_val, y_pred_proba)
-        cv_scores.append(score)
+    return float(np.mean(cv_scores))
 
-    return np.mean(cv_scores)
 
-study = optuna.create_study(direction='maximize', study_name='CatBoost Optimization')
-study.optimize(lambda trial: objective(trial, X_train, y_train, cat_features), n_trials=20, show_progress_bar=True)
+study = optuna.create_study(
+    direction='maximize', study_name='енвлдедлегнрд'
+)
+study.optimize(
+    lambda trial: objective(trial, X_train, y_train),
+    n_trials=50,
+    show_progress_bar=True,
+)
 
 print("\nЛучшие гиперпараметры:")
 print(study.best_params)
 print(f"Лучшее значение ROC-AUC на кросс-валидации: {study.best_value:.4f}")
 
-best_params = study.best_params
-best_params['random_seed'] = 42
-best_params['verbose'] = False
-best_params['auto_class_weights'] = 'Balanced'
-best_params['early_stopping_rounds'] = 50
+best_clf = HistGradientBoostingClassifier(
+    random_state=42,
+    class_weight='balanced',
+    early_stopping=True,
+    validation_fraction=0.12,
+    n_iter_no_change=25,
+    **study.best_params,
+)
+final_pipeline = Pipeline(
+    steps=[('preprocessor', clone(preprocessor)), ('classifier', best_clf)]
+)
+final_pipeline.fit(X_train, y_train)
 
-final_model = CatBoostClassifier(**best_params)
-final_model.fit(X_train, y_train,
-                cat_features=cat_features,
-                eval_set=(X_test, y_test),
-                verbose=False)
-
-y_pred_proba_final = final_model.predict_proba(X_test)[:, 1]
+y_pred_proba_final = final_pipeline.predict_proba(X_test)[:, 1]
 roc_auc_final = roc_auc_score(y_test, y_pred_proba_final)
 
-print(f"ROC-AUC константного предсказания: 0.5000")
+print(f"ROC-AUC константного предсказания: {roc_auc_dummy:.4f}")
 print(f"ROC-AUC бейзлайна (LogReg): {roc_auc:.4f}")
-print(f"ROC-AUC сложной модели (CatBoost): {roc_auc_final:.4f}")
+print(f"ROC-AUC сложной модели (HistGradientBoosting + Optuna): {roc_auc_final:.4f}")
 
 # Небольшой анализ
 improvement = (roc_auc_final - roc_auc) / roc_auc * 100
@@ -163,25 +170,27 @@ import matplotlib.pyplot as plt
 
 print("Расчёт SHAP значений (может занять некоторое время)...")
 
-# Создаём explainer
-explainer = shap.TreeExplainer(final_model)
-
-# Берём подвыборку для ускорения
 X_sample = X_test.sample(min(500, len(X_test)), random_state=42)
+pre = final_pipeline.named_steps['preprocessor']
+clf = final_pipeline.named_steps['classifier']
+X_sample_t = pre.transform(X_sample)
+feature_names = list(pre.get_feature_names_out())
 
-# Рассчитываем SHAP
-shap_values = explainer.shap_values(X_sample)
+explainer = shap.TreeExplainer(clf)
+shap_values = explainer.shap_values(X_sample_t)
+if isinstance(shap_values, list):
+    shap_values = shap_values[1]
 
 # Визуализация 1: summary plot
 plt.figure(figsize=(12, 8))
-shap.summary_plot(shap_values, X_sample, feature_names=X_sample.columns.tolist())
+shap.summary_plot(shap_values, X_sample_t, feature_names=feature_names)
 plt.title("SHAP Summary Plot – влияние признаков на прогноз смертности")
 plt.tight_layout()
 plt.show()
 
 # Визуализация 2: bar plot
 plt.figure(figsize=(10, 6))
-shap.summary_plot(shap_values, X_sample, feature_names=X_sample.columns.tolist(), plot_type="bar")
+shap.summary_plot(shap_values, X_sample_t, feature_names=feature_names, plot_type="bar")
 plt.title("Важность признаков (среднее абсолютное SHAP значение)")
 plt.tight_layout()
 plt.show()
